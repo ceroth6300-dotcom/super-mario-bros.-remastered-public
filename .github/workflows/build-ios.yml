@@ -1,5 +1,5 @@
 
-name: Build Mario SideStore IPA
+name: Diagnose Mario iOS Export
 
 on:
   workflow_dispatch:
@@ -8,35 +8,44 @@ permissions:
   contents: read
 
 jobs:
-  build:
+  diagnose-ios:
     runs-on: macos-15
-    timeout-minutes: 120
+    timeout-minutes: 90
 
     steps:
       - name: Checkout game
         uses: actions/checkout@v4
 
-      - name: Install Godot
+      - name: Install Godot 4.6.1
         shell: bash
         run: |
           set -euo pipefail
+
+          mkdir -p build /tmp/godot
+
           BASE="https://github.com/godotengine/godot/releases/download/4.6.1-stable"
 
           curl -fL --retry 3 \
             "$BASE/Godot_v4.6.1-stable_macos.universal.zip" \
             -o /tmp/godot.zip
 
-          unzip -q /tmp/godot.zip -d /tmp
+          unzip -q /tmp/godot.zip -d /tmp/godot
 
-          GODOT="/tmp/Godot.app/Contents/MacOS/Godot"
-          test -f "$GODOT"
+          GODOT=$(find /tmp/godot -type f \
+            -path "*/MacOS/Godot" -print -quit)
+
+          test -n "$GODOT"
           chmod +x "$GODOT"
+
           echo "GODOT=$GODOT" >> "$GITHUB_ENV"
 
-      - name: Install export templates
+          "$GODOT" --headless --version
+
+      - name: Install iOS templates
         shell: bash
         run: |
           set -euo pipefail
+
           BASE="https://github.com/godotengine/godot/releases/download/4.6.1-stable"
 
           curl -fL --retry 3 \
@@ -44,21 +53,27 @@ jobs:
             -o /tmp/templates.tpz
 
           mkdir -p /tmp/templates
-          unzip -q /tmp/templates.tpz -d /tmp/templates
+
+          unzip -q /tmp/templates.tpz \
+            -d /tmp/templates
 
           DEST="$HOME/Library/Application Support/Godot/export_templates/4.6.1.stable"
+
           mkdir -p "$DEST"
+
           cp -R /tmp/templates/templates/. "$DEST/"
 
           test -f "$DEST/ios.zip"
 
-      - name: Prepare iOS build
+          echo "iOS templates installed."
+
+      - name: Prepare export configuration
         shell: bash
         env:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           set -euo pipefail
-          mkdir -p build
+          mkdir -p build/output
 
           python3 - <<'PY'
           from pathlib import Path
@@ -67,51 +82,52 @@ jobs:
           import struct
           import zlib
 
-          project = Path("project.godot")
-          data = project.read_text()
+          p = Path("project.godot")
+          data = p.read_text()
 
-          controls = Path("Scripts/iOS/MobileControls.gd")
-          entry = 'MobileControls="*res://Scripts/iOS/MobileControls.gd"'
+          control = Path(
+              "Scripts/iOS/MobileControls.gd"
+          )
 
-          if controls.is_file() and entry not in data:
+          entry = (
+              'MobileControls='
+              '"*res://Scripts/iOS/MobileControls.gd"'
+          )
+
+          if control.is_file() and entry not in data:
+              if "[autoload]" not in data:
+                  raise SystemExit(
+                      "Missing [autoload] section"
+                  )
               data = data.replace(
                   "[autoload]",
                   "[autoload]\n" + entry,
                   1
               )
 
+          # Disable editor plugins in CI.
           data = re.sub(
               r'(?m)^enabled=PackedStringArray\([^)]*\)',
               'enabled=PackedStringArray()',
               data
           )
+          p.write_text(data)
 
-          project.write_text(data)
+          # Generate temporary 1024px PNG icon.
+          size = 1024
+          raw = (
+              b"\x00"
+              + bytes([45, 112, 210]) * size
+          ) * size
 
-          # Disable native editor extensions for CI.
-          # These files are restored when the runner ends.
-          disabled = []
-          for ext in Path("addons").rglob("*.gdextension"):
-              renamed = ext.with_suffix(".gdextension.disabled")
-              ext.rename(renamed)
-              disabled.append(str(ext))
-
-          Path("build/disabled-extensions.txt").write_text(
-              "\n".join(disabled)
-          )
-
-          # Generate a temporary opaque 1024x1024 icon.
-          width = height = 1024
-          row = b"\x00" + bytes([40, 110, 210]) * width
-          raw = row * height
-
-          def chunk(name, payload):
+          def chunk(tag, payload):
               return (
                   struct.pack(">I", len(payload))
-                  + name + payload
+                  + tag + payload
                   + struct.pack(
                       ">I",
-                      zlib.crc32(name + payload) & 0xffffffff
+                      zlib.crc32(tag + payload)
+                      & 0xffffffff
                   )
               )
 
@@ -121,52 +137,64 @@ jobs:
                   b"IHDR",
                   struct.pack(
                       ">IIBBBBB",
-                      width, height, 8, 2, 0, 0, 0
+                      size, size, 8, 2, 0, 0, 0
                   )
               )
               + chunk(b"IDAT", zlib.compress(raw))
               + chunk(b"IEND", b"")
           )
 
-          Path("build/ios-icon.png").write_bytes(png)
+          Path("ios-icon.png").write_bytes(png)
 
+          # Preserve existing export presets.
           cfg = Path("export_presets.cfg")
           old = cfg.read_text() if cfg.exists() else ""
 
-          ids = [
-              int(n) for n in re.findall(
-                  r'(?m)^\[preset\.(\d+)\]$',
-                  old
-              )
-          ]
-          index = max(ids, default=-1) + 1
+          existing = re.findall(
+              r'(?m)^\[preset\.(\d+)\]$',
+              old
+          )
 
-          team = os.environ.get("APPLE_TEAM_ID", "").strip()
+          idx = max(
+              (int(n) for n in existing),
+              default=-1
+          ) + 1
+
+          team = os.getenv(
+              "APPLE_TEAM_ID", ""
+          ).strip()
+
           if not team:
               team = "ABCDE12345"
               print(
-                  "WARNING: Using placeholder Team ID "
-                  "for Xcode-project-only export."
+                  "WARNING: Placeholder Apple Team ID."
+              )
+
+          if not re.fullmatch(
+              r"[A-Z0-9]{10}", team
+          ):
+              raise SystemExit(
+                  "Invalid Apple Team ID format"
               )
 
           preset = f"""
-          [preset.{index}]
+          [preset.{idx}]
 
-          name="iOS"
+          name="iOS Diagnostic"
           platform="iOS"
           runnable=true
           advanced_options=false
           custom_features=""
           export_filter="all_resources"
-          include_filter="*.json,*.txt,*.bgm,*.mp3,*.fnt"
+          include_filter=""
           exclude_filter=""
-          export_path="build/MarioIOS.zip"
+          export_path="build/output/MarioIOS.zip"
           encryption_include_filters=""
           encryption_exclude_filters=""
           encrypt_pck=false
           encrypt_directory=false
 
-          [preset.{index}.options]
+          [preset.{idx}.options]
 
           custom_template/debug=""
           custom_template/release=""
@@ -175,7 +203,7 @@ jobs:
           application/short_version="1.0"
           application/version="1"
           application/export_project_only=true
-          icons/app_store_1024x1024="res://build/ios-icon.png"
+          icons/app_store_1024x1024="res://ios-icon.png"
           """
 
           cfg.write_text(
@@ -186,7 +214,15 @@ jobs:
               ) + "\n"
           )
 
-          print("iOS preset configured")
+          safe = cfg.read_text().replace(
+              team, "REDACTED_TEAM_ID"
+          )
+
+          Path(
+              "build/export-preset-diagnostic.txt"
+          ).write_text(safe)
+
+          print("Diagnostic iOS preset prepared.")
           PY
 
       - name: Import resources
@@ -194,137 +230,58 @@ jobs:
         run: |
           set +e
 
-          "$GODOT" --headless --path . \
+          "$GODOT" --headless \
+            --verbose \
+            --path . \
             --editor --import --quit \
             > build/import.log 2>&1
 
           STATUS=$?
-          set -e
 
-          tail -80 build/import.log
+          echo "$STATUS" > build/import-exit-code.txt
+          echo "Import exit code: $STATUS"
 
-          if [ "$STATUS" -ne 0 ]; then
-            echo "::warning::Godot import exited with $STATUS"
-            if [ ! -d ".godot/imported" ]; then
-              exit 1
-            fi
-          fi
+          tail -100 build/import.log
 
-      - name: Export iOS Xcode project
+          exit 0
+
+      - name: Diagnose iOS export
         shell: bash
         run: |
           set +e
 
-          "$GODOT" --headless --path . \
-            --export-release "iOS" \
-            build/MarioIOS.zip \
+          "$GODOT" --headless \
+            --verbose \
+            --path . \
+            --export-release "iOS Diagnostic" \
+            build/output/MarioIOS.zip \
             > build/export.log 2>&1
 
           STATUS=$?
-          set -e
 
-          echo "Godot export exit: $STATUS"
-          tail -150 build/export.log
+          echo "$STATUS" > build/export-exit-code.txt
+          echo "Export exit code: $STATUS"
 
-          if [ ! -s build/MarioIOS.zip ]; then
-            echo "::error::iOS export failed."
+          tail -200 build/export.log
+
+          if [ -s build/output/MarioIOS.zip ]; then
+            echo "Xcode export created!"
+            unzip -t build/output/MarioIOS.zip
+          else
+            echo "::error::Godot iOS export failed."
             exit 1
           fi
 
-          unzip -t build/MarioIOS.zip
-
-          mkdir -p build/xcode
-          unzip -q build/MarioIOS.zip -d build/xcode
-
-      - name: Compile unsigned app
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          PROJECT=$(find build/xcode \
-            -type d -name "*.xcodeproj" \
-            -print -quit)
-
-          test -n "$PROJECT"
-
-          xcodebuild -list -json \
-            -project "$PROJECT" \
-            > build/xcode-targets.json
-
-          SCHEME=$(python3 - <<'PY'
-          import json
-
-          with open("build/xcode-targets.json") as f:
-              data = json.load(f)
-
-          project = data.get("project", {})
-          schemes = project.get("schemes", [])
-
-          if not schemes:
-              raise SystemExit("No Xcode schemes available")
-
-          print(schemes[0])
-          PY
-          )
-
-          set +e
-
-          xcodebuild \
-            -project "$PROJECT" \
-            -scheme "$SCHEME" \
-            -configuration Release \
-            -sdk iphoneos \
-            -destination "generic/platform=iOS" \
-            -derivedDataPath "$PWD/build/DerivedData" \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_IDENTITY="" \
-            build \
-            > build/xcode-build.log 2>&1
-
-          STATUS=$?
-          set -e
-
-          tail -120 build/xcode-build.log
-          exit "$STATUS"
-
-      - name: Package SideStore IPA
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          APP=$(find build/DerivedData/Build/Products \
-            -type d -name "*.app" \
-            -print -quit)
-
-          test -n "$APP"
-
-          mkdir -p build/package/Payload
-          cp -R "$APP" build/package/Payload/
-
-          cd build/package
-
-          zip -qry \
-            ../Mario-Remastered-iOS-unsigned.ipa \
-            Payload
-
-          cd ../..
-
-          test -s \
-            build/Mario-Remastered-iOS-unsigned.ipa
-
-          echo "IPA packaging complete"
-
-      - name: Upload IPA and diagnostics
+      - name: Upload diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Mario-SideStore-Build
+          name: Mario-iOS-Diagnostics
           path: |
-            build/*.ipa
             build/import.log
             build/export.log
-            build/xcode-build.log
-            build/xcode-targets.json
-            build/disabled-extensions.txt
+            build/import-exit-code.txt
+            build/export-exit-code.txt
+            build/export-preset-diagnostic.txt
+            build/output/MarioIOS.zip
           if-no-files-found: warn
