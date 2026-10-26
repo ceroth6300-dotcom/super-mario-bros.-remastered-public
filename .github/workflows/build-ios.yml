@@ -10,10 +10,10 @@ jobs:
     timeout-minutes: 120
 
     steps:
-      - name: Checkout game
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Godot
+      - name: Install Godot 4.6.1
         shell: bash
         run: |
           set -euo pipefail
@@ -33,7 +33,7 @@ jobs:
           chmod +x "$GODOT"
           echo "GODOT=$GODOT" >> "$GITHUB_ENV"
 
-      - name: Install export templates
+      - name: Install iOS templates
         shell: bash
         run: |
           set -euo pipefail
@@ -44,27 +44,29 @@ jobs:
             -o /tmp/templates.tpz
 
           DEST="$HOME/Library/Application Support/Godot/export_templates/4.6.1.stable"
-          mkdir -p "$DEST" /tmp/templates
 
+          mkdir -p "$DEST" /tmp/templates
           unzip -q /tmp/templates.tpz -d /tmp/templates
           cp -R /tmp/templates/templates/. "$DEST/"
 
           test -f "$DEST/ios.zip"
 
-      - name: Configure iOS
+      - name: Prepare project
         shell: bash
         run: |
           set -euo pipefail
+          mkdir -p build
 
           python3 - <<'PY'
           from pathlib import Path
           import re
+          import textwrap
 
-          p = Path("project.godot")
-          data = p.read_text()
+          path = Path("project.godot")
+          data = path.read_text()
 
-          controls = Path("Scripts/iOS/MobileControls.gd")
           entry = 'MobileControls="*res://Scripts/iOS/MobileControls.gd"'
+          controls = Path("Scripts/iOS/MobileControls.gd")
 
           if controls.is_file() and entry not in data:
               if "[autoload]" not in data:
@@ -80,22 +82,22 @@ jobs:
               'enabled=PackedStringArray()',
               data
           )
-          p.write_text(data)
+
+          path.write_text(data)
 
           cfg = Path("export_presets.cfg")
-          text = cfg.read_text() if cfg.exists() else ""
+          old = cfg.read_text() if cfg.exists() else ""
 
-          matches = list(re.finditer(
-              r'(?m)^\[preset\.(\d+)\]$',
-              text
-          ))
-          index = max(
-              (int(m.group(1)) for m in matches),
-              default=-1
-          ) + 1
+          ids = [
+              int(x) for x in re.findall(
+                  r'(?m)^\[preset\.(\d+)\]$',
+                  old
+              )
+          ]
+          idx = max(ids, default=-1) + 1
 
-          block = f"""
-          [preset.{index}]
+          preset = f"""
+          [preset.{idx}]
 
           name="iOS"
           platform="iOS"
@@ -111,7 +113,7 @@ jobs:
           encrypt_pck=false
           encrypt_directory=false
 
-          [preset.{index}.options]
+          [preset.{idx}.options]
 
           application/app_store_team_id="ABCDE12345"
           application/bundle_identifier="com.ceroth6300.marioremastered"
@@ -121,63 +123,62 @@ jobs:
           """
 
           cfg.write_text(
-              text.rstrip() + "\n\n" + block.strip() + "\n"
+              old.rstrip() + "\n\n" +
+              textwrap.dedent(preset).strip() + "\n"
           )
+
+          print("iOS configuration prepared")
           PY
 
-      - name: Import assets
+      - name: Import game assets
         shell: bash
         run: |
-          mkdir -p build
-
           set +e
+
           "$GODOT" --headless --path . \
             --editor --import --quit \
             > build/import.log 2>&1
+
           STATUS=$?
           set -e
 
-          echo "Import exit status: $STATUS"
-          tail -60 build/import.log
+          echo "Import exit code: $STATUS"
+          tail -100 build/import.log
 
           if [ "$STATUS" -ne 0 ]; then
-            if grep -q "Finalizing Asset Import" \
-              build/import.log && \
-              grep -q "Started Loading editor" \
-              build/import.log; then
-              echo "::warning::Import reached finalization but Godot crashed during editor shutdown."
-              echo "Attempting export anyway."
+            if [ -d ".godot/imported" ] && \
+               grep -q "Finalizing Asset Import" build/import.log; then
+              echo "::warning::Godot crashed after reaching import finalization. Trying export."
             else
-              echo "::error::Import did not reach finalization."
-              exit "$STATUS"
+              echo "::error::Import failed before finalization."
+              exit 1
             fi
           fi
 
-      - name: Export iOS project
+      - name: Export iOS Xcode project
         shell: bash
         run: |
-          mkdir -p build
-
           set +e
+
           "$GODOT" --headless --path . \
             --export-release "iOS" \
             build/MarioIOS.zip \
             > build/export.log 2>&1
+
           STATUS=$?
           set -e
 
-          tail -100 build/export.log
+          tail -120 build/export.log
 
-          if [ -s build/MarioIOS.zip ]; then
-            echo "iOS Xcode export created."
-            unzip -t build/MarioIOS.zip
-          else
-            echo "::error::iOS export missing."
+          if [ ! -s build/MarioIOS.zip ]; then
+            echo "::error::iOS export not created."
             exit 1
           fi
 
+          unzip -t build/MarioIOS.zip
+
           if [ "$STATUS" -ne 0 ]; then
-            echo "::warning::Godot exited with $STATUS after creating export."
+            echo "::warning::Godot exited with code $STATUS after creating the ZIP."
           fi
 
       - name: Upload build and logs
