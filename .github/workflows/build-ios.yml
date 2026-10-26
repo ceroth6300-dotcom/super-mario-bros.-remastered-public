@@ -10,14 +10,16 @@ jobs:
     timeout-minutes: 120
 
     steps:
-      - name: Download game
+      - name: Checkout game
         uses: actions/checkout@v4
 
-      - name: Download Godot 4.6.1
+      - name: Install Godot 4.6.1
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
+
           BASE="https://github.com/godotengine/godot/releases/download/4.6.1-stable"
+
           curl -fL --retry 3 \
             "$BASE/Godot_v4.6.1-stable_macos.universal.zip" \
             -o /tmp/godot.zip
@@ -35,13 +37,16 @@ jobs:
       - name: Install iOS export templates
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
+
           BASE="https://github.com/godotengine/godot/releases/download/4.6.1-stable"
+
           curl -fL --retry 3 \
             "$BASE/Godot_v4.6.1-stable_export_templates.tpz" \
             -o /tmp/templates.tpz
 
           DEST="$HOME/Library/Application Support/Godot/export_templates/4.6.1.stable"
+
           mkdir -p "$DEST"
           mkdir -p /tmp/godot-templates
 
@@ -52,9 +57,11 @@ jobs:
 
           test -f "$DEST/ios.zip"
 
-      - name: Configure iOS export
+      - name: Configure iOS and disable editor plugins
         shell: bash
         run: |
+          set -euo pipefail
+
           python3 - <<'PY'
           from pathlib import Path
           import re
@@ -66,12 +73,22 @@ jobs:
           entry = 'MobileControls="*res://Scripts/iOS/MobileControls.gd"'
 
           if controls.exists() and entry not in data:
+              if "[autoload]" not in data:
+                  raise SystemExit("Missing autoload section")
               data = data.replace(
                   "[autoload]",
                   "[autoload]\n" + entry,
                   1
               )
-              project.write_text(data)
+
+          # Disable editor plugins during CI.
+          data = re.sub(
+              r'(?m)^enabled=PackedStringArray\([^)]*\)',
+              'enabled=PackedStringArray()',
+              data
+          )
+
+          project.write_text(data)
 
           presets = Path("export_presets.cfg")
           text = presets.read_text() if presets.exists() else ""
@@ -82,17 +99,20 @@ jobs:
                   text
               )
           ]
+
           index = max(indices, default=-1) + 1
 
-          text += f'''
-
+          block = f"""
           [preset.{index}]
+
           name="iOS"
           platform="iOS"
           runnable=true
+          advanced_options=false
+          dedicated_server=false
           custom_features=""
           export_filter="all_resources"
-          include_filter="*.bgm, *.mp3, *.txt, *.fnt"
+          include_filter="*.json,*.txt,*.bgm,*.mp3,*.fnt"
           exclude_filter=""
           export_path="build/MarioIOS.zip"
           encryption_include_filters=""
@@ -101,6 +121,7 @@ jobs:
           encrypt_directory=false
 
           [preset.{index}.options]
+
           custom_template/debug=""
           custom_template/release=""
           application/app_store_team_id="ABCDE12345"
@@ -108,27 +129,58 @@ jobs:
           application/short_version="1.0"
           application/version="1"
           application/export_project_only=true
-          '''
-          presets.write_text(text)
+          """
+
+          presets.write_text(
+              text.rstrip() + "\n\n" + block.strip() + "\n"
+          )
+
+          print("iOS export configured")
+          print("Editor plugins disabled")
           PY
 
       - name: Import Godot assets
         shell: bash
         run: |
+          set -uo pipefail
+
+          mkdir -p build
+
           "$GODOT" --headless --path . \
-            --editor --import --quit
+            --editor --import --quit \
+            > build/import.log 2>&1
+
+          RESULT=$?
+
+          tail -100 build/import.log
+
+          if [ "$RESULT" -ne 0 ]; then
+            echo "Godot import exited with code $RESULT"
+            echo "Checking whether the imported project is usable..."
+
+            if [ ! -d ".godot/imported" ]; then
+              exit "$RESULT"
+            fi
+          fi
 
       - name: Export iOS Xcode project
         shell: bash
         run: |
+          set -euo pipefail
+
           mkdir -p build
+
           "$GODOT" --headless --path . \
             --export-release "iOS" \
-            build/MarioIOS.zip
+            build/MarioIOS.zip \
+            2>&1 | tee build/export.log
 
-      - name: Upload iOS project
+          test -f build/MarioIOS.zip
+
+      - name: Upload iOS build
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Mario-iOS-Xcode
+          name: Mario-iOS-Build
           path: build/
-          if-no-files-found: error
+          if-no-files-found: warn
