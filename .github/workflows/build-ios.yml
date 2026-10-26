@@ -1,0 +1,134 @@
+
+name: Build Mario iOS
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-ios:
+    runs-on: macos-15
+    timeout-minutes: 120
+
+    steps:
+      - name: Download game
+        uses: actions/checkout@v4
+
+      - name: Download Godot 4.6.1
+        shell: bash
+        run: |
+          set -e
+          BASE="https://github.com/godotengine/godot/releases/download/4.6.1-stable"
+          curl -fL --retry 3 \
+            "$BASE/Godot_v4.6.1-stable_macos.universal.zip" \
+            -o /tmp/godot.zip
+
+          mkdir -p /tmp/godot
+          unzip -q /tmp/godot.zip -d /tmp/godot
+
+          GODOT=$(find /tmp/godot -type f \
+            -path "*/MacOS/Godot" | head -1)
+
+          test -n "$GODOT"
+          chmod +x "$GODOT"
+          echo "GODOT=$GODOT" >> "$GITHUB_ENV"
+
+      - name: Install iOS export templates
+        shell: bash
+        run: |
+          set -e
+          BASE="https://github.com/godotengine/godot/releases/download/4.6.1-stable"
+          curl -fL --retry 3 \
+            "$BASE/Godot_v4.6.1-stable_export_templates.tpz" \
+            -o /tmp/templates.tpz
+
+          DEST="$HOME/Library/Application Support/Godot/export_templates/4.6.1.stable"
+          mkdir -p "$DEST"
+          mkdir -p /tmp/godot-templates
+
+          unzip -q /tmp/templates.tpz \
+            -d /tmp/godot-templates
+
+          cp -R /tmp/godot-templates/templates/. "$DEST/"
+
+          test -f "$DEST/ios.zip"
+
+      - name: Configure iOS export
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          project = Path("project.godot")
+          data = project.read_text()
+
+          controls = Path("Scripts/iOS/MobileControls.gd")
+          entry = 'MobileControls="*res://Scripts/iOS/MobileControls.gd"'
+
+          if controls.exists() and entry not in data:
+              data = data.replace(
+                  "[autoload]",
+                  "[autoload]\n" + entry,
+                  1
+              )
+              project.write_text(data)
+
+          presets = Path("export_presets.cfg")
+          text = presets.read_text() if presets.exists() else ""
+
+          indices = [
+              int(n) for n in re.findall(
+                  r"(?m)^\[preset\.(\d+)\]$",
+                  text
+              )
+          ]
+          index = max(indices, default=-1) + 1
+
+          text += f'''
+
+          [preset.{index}]
+          name="iOS"
+          platform="iOS"
+          runnable=true
+          custom_features=""
+          export_filter="all_resources"
+          include_filter="*.bgm, *.mp3, *.txt, *.fnt"
+          exclude_filter=""
+          export_path="build/MarioIOS.zip"
+          encryption_include_filters=""
+          encryption_exclude_filters=""
+          encrypt_pck=false
+          encrypt_directory=false
+
+          [preset.{index}.options]
+          custom_template/debug=""
+          custom_template/release=""
+          application/app_store_team_id="ABCDE12345"
+          application/bundle_identifier="com.ceroth6300.marioremastered"
+          application/short_version="1.0"
+          application/version="1"
+          application/export_project_only=true
+          '''
+          presets.write_text(text)
+          PY
+
+      - name: Import Godot assets
+        shell: bash
+        run: |
+          "$GODOT" --headless --path . \
+            --editor --import --quit
+
+      - name: Export iOS Xcode project
+        shell: bash
+        run: |
+          mkdir -p build
+          "$GODOT" --headless --path . \
+            --export-release "iOS" \
+            build/MarioIOS.zip
+
+      - name: Upload iOS project
+        uses: actions/upload-artifact@v4
+        with:
+          name: Mario-iOS-Xcode
+          path: build/
+          if-no-files-found: error
