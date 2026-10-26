@@ -13,11 +13,10 @@ jobs:
       - name: Checkout game
         uses: actions/checkout@v4
 
-      - name: Install Godot 4.6.1
+      - name: Install Godot
         shell: bash
         run: |
           set -euo pipefail
-
           BASE="https://github.com/godotengine/godot/releases/download/4.6.1-stable"
 
           curl -fL --retry 3 \
@@ -34,11 +33,10 @@ jobs:
           chmod +x "$GODOT"
           echo "GODOT=$GODOT" >> "$GITHUB_ENV"
 
-      - name: Install iOS export templates
+      - name: Install export templates
         shell: bash
         run: |
           set -euo pipefail
-
           BASE="https://github.com/godotengine/godot/releases/download/4.6.1-stable"
 
           curl -fL --retry 3 \
@@ -46,18 +44,14 @@ jobs:
             -o /tmp/templates.tpz
 
           DEST="$HOME/Library/Application Support/Godot/export_templates/4.6.1.stable"
+          mkdir -p "$DEST" /tmp/templates
 
-          mkdir -p "$DEST"
-          mkdir -p /tmp/godot-templates
-
-          unzip -q /tmp/templates.tpz \
-            -d /tmp/godot-templates
-
-          cp -R /tmp/godot-templates/templates/. "$DEST/"
+          unzip -q /tmp/templates.tpz -d /tmp/templates
+          cp -R /tmp/templates/templates/. "$DEST/"
 
           test -f "$DEST/ios.zip"
 
-      - name: Configure iOS and disable editor plugins
+      - name: Configure iOS
         shell: bash
         run: |
           set -euo pipefail
@@ -66,13 +60,13 @@ jobs:
           from pathlib import Path
           import re
 
-          project = Path("project.godot")
-          data = project.read_text()
+          p = Path("project.godot")
+          data = p.read_text()
 
           controls = Path("Scripts/iOS/MobileControls.gd")
           entry = 'MobileControls="*res://Scripts/iOS/MobileControls.gd"'
 
-          if controls.exists() and entry not in data:
+          if controls.is_file() and entry not in data:
               if "[autoload]" not in data:
                   raise SystemExit("Missing autoload section")
               data = data.replace(
@@ -81,26 +75,24 @@ jobs:
                   1
               )
 
-          # Disable editor plugins during CI.
           data = re.sub(
               r'(?m)^enabled=PackedStringArray\([^)]*\)',
               'enabled=PackedStringArray()',
               data
           )
+          p.write_text(data)
 
-          project.write_text(data)
+          cfg = Path("export_presets.cfg")
+          text = cfg.read_text() if cfg.exists() else ""
 
-          presets = Path("export_presets.cfg")
-          text = presets.read_text() if presets.exists() else ""
-
-          indices = [
-              int(n) for n in re.findall(
-                  r"(?m)^\[preset\.(\d+)\]$",
-                  text
-              )
-          ]
-
-          index = max(indices, default=-1) + 1
+          matches = list(re.finditer(
+              r'(?m)^\[preset\.(\d+)\]$',
+              text
+          ))
+          index = max(
+              (int(m.group(1)) for m in matches),
+              default=-1
+          ) + 1
 
           block = f"""
           [preset.{index}]
@@ -109,7 +101,6 @@ jobs:
           platform="iOS"
           runnable=true
           advanced_options=false
-          dedicated_server=false
           custom_features=""
           export_filter="all_resources"
           include_filter="*.json,*.txt,*.bgm,*.mp3,*.fnt"
@@ -122,8 +113,6 @@ jobs:
 
           [preset.{index}.options]
 
-          custom_template/debug=""
-          custom_template/release=""
           application/app_store_team_id="ABCDE12345"
           application/bundle_identifier="com.ceroth6300.marioremastered"
           application/short_version="1.0"
@@ -131,53 +120,67 @@ jobs:
           application/export_project_only=true
           """
 
-          presets.write_text(
+          cfg.write_text(
               text.rstrip() + "\n\n" + block.strip() + "\n"
           )
-
-          print("iOS export configured")
-          print("Editor plugins disabled")
           PY
 
-      - name: Import Godot assets
+      - name: Import assets
         shell: bash
         run: |
-          set -uo pipefail
-
           mkdir -p build
 
+          set +e
           "$GODOT" --headless --path . \
             --editor --import --quit \
             > build/import.log 2>&1
+          STATUS=$?
+          set -e
 
-          RESULT=$?
+          echo "Import exit status: $STATUS"
+          tail -60 build/import.log
 
-          tail -100 build/import.log
-
-          if [ "$RESULT" -ne 0 ]; then
-            echo "Godot import exited with code $RESULT"
-            echo "Checking whether the imported project is usable..."
-
-            if [ ! -d ".godot/imported" ]; then
-              exit "$RESULT"
+          if [ "$STATUS" -ne 0 ]; then
+            if grep -q "Finalizing Asset Import" \
+              build/import.log && \
+              grep -q "Started Loading editor" \
+              build/import.log; then
+              echo "::warning::Import reached finalization but Godot crashed during editor shutdown."
+              echo "Attempting export anyway."
+            else
+              echo "::error::Import did not reach finalization."
+              exit "$STATUS"
             fi
           fi
 
-      - name: Export iOS Xcode project
+      - name: Export iOS project
         shell: bash
         run: |
-          set -euo pipefail
-
           mkdir -p build
 
+          set +e
           "$GODOT" --headless --path . \
             --export-release "iOS" \
             build/MarioIOS.zip \
-            2>&1 | tee build/export.log
+            > build/export.log 2>&1
+          STATUS=$?
+          set -e
 
-          test -f build/MarioIOS.zip
+          tail -100 build/export.log
 
-      - name: Upload iOS build
+          if [ -s build/MarioIOS.zip ]; then
+            echo "iOS Xcode export created."
+            unzip -t build/MarioIOS.zip
+          else
+            echo "::error::iOS export missing."
+            exit 1
+          fi
+
+          if [ "$STATUS" -ne 0 ]; then
+            echo "::warning::Godot exited with $STATUS after creating export."
+          fi
+
+      - name: Upload build and logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
