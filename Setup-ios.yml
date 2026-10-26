@@ -1,0 +1,54 @@
+
+name: Setup iOS Controls
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout game
+        uses: actions/checkout@v4
+
+      - name: Update Godot configuration
+        shell: python
+        run: |
+          from pathlib import Path
+
+          path = Path("project.godot")
+          data = path.read_text()
+
+          entry = 'MobileControls="*res://Scripts/iOS/MobileControls.gd"'
+
+          if not Path("Scripts/iOS/MobileControls.gd").is_file():
+              raise SystemExit("Missing MobileControls.gd")
+
+          if entry not in data:
+              if "[autoload]" not in data:
+                  raise SystemExit("Missing autoload section")
+
+              data = data.replace(
+                  "[autoload]",
+                  "[autoload]\n" + entry,
+                  1
+              )
+
+              path.write_text(data)
+
+          print("iOS controls registered!")
+
+      - name: Commit changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add project.godot
+
+          if ! git diff --cached --quiet; then
+            git commit -m "Configure iOS controls"
+            git push
+          fi
