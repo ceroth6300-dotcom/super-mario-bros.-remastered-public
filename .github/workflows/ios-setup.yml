@@ -1,0 +1,58 @@
+
+name: iOS Setup
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/ios-setup.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare iOS controls
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          project = Path("project.godot")
+          controls = Path(
+              "Scripts/iOS/MobileControls.gd"
+          )
+
+          assert project.exists(), "Missing project.godot"
+          assert controls.exists(), "Missing touch controls"
+
+          text = project.read_text()
+          entry = (
+              'MobileControls='
+              '"*res://Scripts/iOS/MobileControls.gd"'
+          )
+
+          if entry not in text:
+              text = text.replace(
+                  "[autoload]",
+                  "[autoload]\n" + entry,
+                  1
+              )
+              project.write_text(text)
+
+          print("iOS controls configured successfully!")
+          PY
+
+      - name: Upload configured project
+        uses: actions/upload-artifact@v4
+        with:
+          name: mario-ios-setup
+          path: |
+            project.godot
+            Scripts/iOS/MobileControls.gd
