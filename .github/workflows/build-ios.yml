@@ -5,18 +5,18 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-ios:
+  ios:
     runs-on: macos-15
     timeout-minutes: 120
 
     steps:
-      - name: Checkout
+      - name: Checkout game
         uses: actions/checkout@v4
 
-      - name: Install Godot 4.6.1
+      - name: Install Godot
         shell: bash
         run: |
-          set -euo pipefail
+          set -e
           BASE="https://github.com/godotengine/godot/releases/download/4.6.1-stable"
 
           curl -fL --retry 3 \
@@ -36,7 +36,7 @@ jobs:
       - name: Install iOS templates
         shell: bash
         run: |
-          set -euo pipefail
+          set -e
           BASE="https://github.com/godotengine/godot/releases/download/4.6.1-stable"
 
           curl -fL --retry 3 \
@@ -51,24 +51,28 @@ jobs:
 
           test -f "$DEST/ios.zip"
 
-      - name: Prepare project
+      - name: Configure game for iOS
         shell: bash
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
-          set -euo pipefail
+          set -e
           mkdir -p build
 
           python3 - <<'PY'
           from pathlib import Path
+          import os
           import re
-          import textwrap
+          import struct
+          import zlib
 
-          path = Path("project.godot")
-          data = path.read_text()
+          project = Path("project.godot")
+          data = project.read_text()
 
-          entry = 'MobileControls="*res://Scripts/iOS/MobileControls.gd"'
           controls = Path("Scripts/iOS/MobileControls.gd")
+          entry = 'MobileControls="*res://Scripts/iOS/MobileControls.gd"'
 
-          if controls.is_file() and entry not in data:
+          if controls.exists() and entry not in data:
               if "[autoload]" not in data:
                   raise SystemExit("Missing autoload section")
               data = data.replace(
@@ -83,18 +87,83 @@ jobs:
               data
           )
 
-          path.write_text(data)
+          project.write_text(data)
 
-          cfg = Path("export_presets.cfg")
-          old = cfg.read_text() if cfg.exists() else ""
+          # Generate a temporary 1024px iOS icon.
+          width = 1024
+          height = 1024
+          row = bytes([33, 91, 172]) * width
+          raw = b"".join(
+              b"\x00" + row for _ in range(height)
+          )
+
+          def chunk(tag, payload):
+              return (
+                  struct.pack(">I", len(payload))
+                  + tag + payload
+                  + struct.pack(
+                      ">I",
+                      zlib.crc32(tag + payload)
+                      & 0xffffffff
+                  )
+              )
+
+          png = (
+              b"\x89PNG\r\n\x1a\n"
+              + chunk(
+                  b"IHDR",
+                  struct.pack(
+                      ">IIBBBBB",
+                      width, height, 8, 2, 0, 0, 0
+                  )
+              )
+              + chunk(b"IDAT", zlib.compress(raw))
+              + chunk(b"IEND", b"")
+          )
+
+          Path("build/ios-icon.png").write_bytes(png)
+
+          config = Path("export_presets.cfg")
+          old = (
+              config.read_text()
+              if config.exists() else ""
+          )
+
+          # Remove previous iOS presets in CI only.
+          parts = re.split(
+              r'(?=^\[preset\.\d+\]$)',
+              old,
+              flags=re.MULTILINE
+          )
+
+          kept = [parts[0]]
+          for part in parts[1:]:
+              if not re.search(
+                  r'(?m)^platform="iOS"$', part
+              ):
+                  kept.append(part)
+
+          old = "".join(kept)
 
           ids = [
-              int(x) for x in re.findall(
+              int(i) for i in re.findall(
                   r'(?m)^\[preset\.(\d+)\]$',
                   old
               )
           ]
+
           idx = max(ids, default=-1) + 1
+
+          team = os.environ.get(
+              "APPLE_TEAM_ID", ""
+          ).strip() or "ABCDE12345"
+
+          if not re.fullmatch(
+              r'[A-Z0-9]{10}', team
+          ):
+              raise SystemExit(
+                  "APPLE_TEAM_ID must be 10 characters"
+              )
 
           preset = f"""
           [preset.{idx}]
@@ -115,22 +184,30 @@ jobs:
 
           [preset.{idx}.options]
 
-          application/app_store_team_id="ABCDE12345"
+          custom_template/debug=""
+          custom_template/release=""
+          application/app_store_team_id="{team}"
           application/bundle_identifier="com.ceroth6300.marioremastered"
           application/short_version="1.0"
           application/version="1"
           application/export_project_only=true
+          icons/icon_1024x1024="res://build/ios-icon.png"
           """
 
-          cfg.write_text(
-              old.rstrip() + "\n\n" +
-              textwrap.dedent(preset).strip() + "\n"
+          config.write_text(
+              old.rstrip()
+              + "\n\n"
+              + "\n".join(
+                  line.strip()
+                  for line in preset.strip().splitlines()
+              )
+              + "\n"
           )
 
-          print("iOS configuration prepared")
+          print("iOS preset created.")
           PY
 
-      - name: Import game assets
+      - name: Import assets
         shell: bash
         run: |
           set +e
@@ -142,20 +219,19 @@ jobs:
           STATUS=$?
           set -e
 
-          echo "Import exit code: $STATUS"
-          tail -100 build/import.log
+          echo "Import status: $STATUS"
+          tail -80 build/import.log
 
           if [ "$STATUS" -ne 0 ]; then
-            if [ -d ".godot/imported" ] && \
-               grep -q "Finalizing Asset Import" build/import.log; then
-              echo "::warning::Godot crashed after reaching import finalization. Trying export."
+            if [ -d ".godot/imported" ]; then
+              echo "::warning::Import crashed; attempting export for diagnostics."
             else
-              echo "::error::Import failed before finalization."
+              echo "::error::No imported assets."
               exit 1
             fi
           fi
 
-      - name: Export iOS Xcode project
+      - name: Export Xcode project
         shell: bash
         run: |
           set +e
@@ -168,20 +244,21 @@ jobs:
           STATUS=$?
           set -e
 
-          tail -120 build/export.log
+          echo "Export status: $STATUS"
+          cat build/export.log
 
           if [ ! -s build/MarioIOS.zip ]; then
-            echo "::error::iOS export not created."
+            echo "::error::iOS export missing."
             exit 1
           fi
 
           unzip -t build/MarioIOS.zip
 
           if [ "$STATUS" -ne 0 ]; then
-            echo "::warning::Godot exited with code $STATUS after creating the ZIP."
+            echo "::warning::Godot exited abnormally after creating export."
           fi
 
-      - name: Upload build and logs
+      - name: Upload build and diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
