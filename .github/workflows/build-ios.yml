@@ -1,22 +1,26 @@
 
-name: Build Mario iOS
+name: Build Mario SideStore IPA
 
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
-  ios:
+  build-ios:
     runs-on: macos-15
     timeout-minutes: 120
 
     steps:
-      - name: Checkout game
+      - name: Checkout Mario project
         uses: actions/checkout@v4
 
-      - name: Install Godot
+      - name: Install Godot 4.6.1
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
+
           BASE="https://github.com/godotengine/godot/releases/download/4.6.1-stable"
 
           curl -fL --retry 3 \
@@ -27,16 +31,20 @@ jobs:
           unzip -q /tmp/godot.zip -d /tmp/godot
 
           GODOT=$(find /tmp/godot -type f \
-            -path "*/MacOS/Godot" | head -1)
+            -path "*/MacOS/Godot" -print -quit)
 
           test -n "$GODOT"
           chmod +x "$GODOT"
+
           echo "GODOT=$GODOT" >> "$GITHUB_ENV"
 
-      - name: Install iOS templates
+          "$GODOT" --headless --version
+
+      - name: Install iOS export templates
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
+
           BASE="https://github.com/godotengine/godot/releases/download/4.6.1-stable"
 
           curl -fL --retry 3 \
@@ -45,42 +53,53 @@ jobs:
 
           DEST="$HOME/Library/Application Support/Godot/export_templates/4.6.1.stable"
 
-          mkdir -p "$DEST" /tmp/templates
-          unzip -q /tmp/templates.tpz -d /tmp/templates
-          cp -R /tmp/templates/templates/. "$DEST/"
+          mkdir -p "$DEST"
+          mkdir -p /tmp/godot-templates
+
+          unzip -q /tmp/templates.tpz \
+            -d /tmp/godot-templates
+
+          cp -R /tmp/godot-templates/templates/. "$DEST/"
 
           test -f "$DEST/ios.zip"
 
-      - name: Configure game for iOS
+          echo "iOS templates installed."
+
+      - name: Configure iOS project
         shell: bash
-        env:
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
-          set -e
+          set -euo pipefail
           mkdir -p build
 
           python3 - <<'PY'
           from pathlib import Path
-          import os
           import re
-          import struct
-          import zlib
 
           project = Path("project.godot")
           data = project.read_text()
 
-          controls = Path("Scripts/iOS/MobileControls.gd")
-          entry = 'MobileControls="*res://Scripts/iOS/MobileControls.gd"'
+          controls = Path(
+              "Scripts/iOS/MobileControls.gd"
+          )
 
-          if controls.exists() and entry not in data:
+          entry = (
+              'MobileControls='
+              '"*res://Scripts/iOS/MobileControls.gd"'
+          )
+
+          if controls.is_file() and entry not in data:
               if "[autoload]" not in data:
-                  raise SystemExit("Missing autoload section")
+                  raise SystemExit(
+                      "Autoload section not found"
+                  )
+
               data = data.replace(
                   "[autoload]",
                   "[autoload]\n" + entry,
                   1
               )
 
+          # Disable editor-only plugins for CI.
           data = re.sub(
               r'(?m)^enabled=PackedStringArray\([^)]*\)',
               'enabled=PackedStringArray()',
@@ -89,89 +108,30 @@ jobs:
 
           project.write_text(data)
 
-          # Generate a temporary 1024px iOS icon.
-          width = 1024
-          height = 1024
-          row = bytes([33, 91, 172]) * width
-          raw = b"".join(
-              b"\x00" + row for _ in range(height)
-          )
-
-          def chunk(tag, payload):
-              return (
-                  struct.pack(">I", len(payload))
-                  + tag + payload
-                  + struct.pack(
-                      ">I",
-                      zlib.crc32(tag + payload)
-                      & 0xffffffff
-                  )
-              )
-
-          png = (
-              b"\x89PNG\r\n\x1a\n"
-              + chunk(
-                  b"IHDR",
-                  struct.pack(
-                      ">IIBBBBB",
-                      width, height, 8, 2, 0, 0, 0
-                  )
-              )
-              + chunk(b"IDAT", zlib.compress(raw))
-              + chunk(b"IEND", b"")
-          )
-
-          Path("build/ios-icon.png").write_bytes(png)
-
-          config = Path("export_presets.cfg")
+          cfg = Path("export_presets.cfg")
           old = (
-              config.read_text()
-              if config.exists() else ""
+              cfg.read_text()
+              if cfg.exists() else ""
           )
-
-          # Remove previous iOS presets in CI only.
-          parts = re.split(
-              r'(?=^\[preset\.\d+\]$)',
-              old,
-              flags=re.MULTILINE
-          )
-
-          kept = [parts[0]]
-          for part in parts[1:]:
-              if not re.search(
-                  r'(?m)^platform="iOS"$', part
-              ):
-                  kept.append(part)
-
-          old = "".join(kept)
 
           ids = [
-              int(i) for i in re.findall(
+              int(n)
+              for n in re.findall(
                   r'(?m)^\[preset\.(\d+)\]$',
                   old
               )
           ]
 
-          idx = max(ids, default=-1) + 1
-
-          team = os.environ.get(
-              "APPLE_TEAM_ID", ""
-          ).strip() or "ABCDE12345"
-
-          if not re.fullmatch(
-              r'[A-Z0-9]{10}', team
-          ):
-              raise SystemExit(
-                  "APPLE_TEAM_ID must be 10 characters"
-              )
+          index = max(ids, default=-1) + 1
 
           preset = f"""
-          [preset.{idx}]
+          [preset.{index}]
 
           name="iOS"
           platform="iOS"
           runnable=true
           advanced_options=false
+          dedicated_server=false
           custom_features=""
           export_filter="all_resources"
           include_filter="*.json,*.txt,*.bgm,*.mp3,*.fnt"
@@ -182,19 +142,20 @@ jobs:
           encrypt_pck=false
           encrypt_directory=false
 
-          [preset.{idx}.options]
+          [preset.{index}.options]
 
           custom_template/debug=""
           custom_template/release=""
-          application/app_store_team_id="{team}"
+          application/app_store_team_id="ABCDE12345"
           application/bundle_identifier="com.ceroth6300.marioremastered"
           application/short_version="1.0"
           application/version="1"
           application/export_project_only=true
+          application/icon_interpolation=4
           icons/icon_1024x1024="res://build/ios-icon.png"
           """
 
-          config.write_text(
+          cfg.write_text(
               old.rstrip()
               + "\n\n"
               + "\n".join(
@@ -204,31 +165,40 @@ jobs:
               + "\n"
           )
 
-          print("iOS preset created.")
+          print("Mario iOS export preset created.")
           PY
 
-      - name: Import assets
+          test -f icon.png
+
+          sips -s format png \
+            -z 1024 1024 icon.png \
+            --out build/ios-icon.png
+
+      - name: Import game resources
         shell: bash
         run: |
           set +e
 
-          "$GODOT" --headless --path . \
+          "$GODOT" --headless \
+            --path . \
             --editor --import --quit \
             > build/import.log 2>&1
 
           STATUS=$?
           set -e
 
-          echo "Import status: $STATUS"
-          tail -80 build/import.log
+          echo "Import exit code: $STATUS"
+          tail -100 build/import.log
 
           if [ "$STATUS" -ne 0 ]; then
-            if [ -d ".godot/imported" ]; then
-              echo "::warning::Import crashed; attempting export for diagnostics."
-            else
+            echo "::warning::Import exited abnormally."
+
+            if [ ! -d ".godot/imported" ]; then
               echo "::error::No imported assets."
               exit 1
             fi
+
+            echo "Trying export for diagnostics."
           fi
 
       - name: Export Xcode project
@@ -236,7 +206,8 @@ jobs:
         run: |
           set +e
 
-          "$GODOT" --headless --path . \
+          "$GODOT" --headless \
+            --path . \
             --export-release "iOS" \
             build/MarioIOS.zip \
             > build/export.log 2>&1
@@ -244,24 +215,123 @@ jobs:
           STATUS=$?
           set -e
 
-          echo "Export status: $STATUS"
-          cat build/export.log
+          echo "Export exit code: $STATUS"
+          tail -150 build/export.log
 
           if [ ! -s build/MarioIOS.zip ]; then
-            echo "::error::iOS export missing."
+            echo "::error::Godot did not export an Xcode project."
             exit 1
           fi
 
           unzip -t build/MarioIOS.zip
 
-          if [ "$STATUS" -ne 0 ]; then
-            echo "::warning::Godot exited abnormally after creating export."
+          mkdir -p build/xcode
+          unzip -q build/MarioIOS.zip \
+            -d build/xcode
+
+          find build/xcode -name "*.xcodeproj"
+
+      - name: Compile unsigned iPhone app
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PROJECT=$(find build/xcode \
+            -name "*.xcodeproj" \
+            -type d -print -quit)
+
+          if [ -z "$PROJECT" ]; then
+            echo "::error::Xcode project not found."
+            exit 1
           fi
 
-      - name: Upload build and diagnostics
+          echo "Building $PROJECT"
+
+          xcodebuild -list -json \
+            -project "$PROJECT" \
+            > build/xcode-targets.json
+
+          TARGET=$(python3 - <<'PY'
+          import json
+
+          with open("build/xcode-targets.json") as f:
+              data = json.load(f)
+
+          project = data.get("project", {})
+          targets = project.get("targets", [])
+
+          if not targets:
+              raise SystemExit("No Xcode targets found")
+
+          print(targets[0])
+          PY
+          )
+
+          set +e
+
+          xcodebuild \
+            -project "$PROJECT" \
+            -target "$TARGET" \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath "$PWD/build/DerivedData" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build \
+            > build/xcode-build.log 2>&1
+
+          STATUS=$?
+          set -e
+
+          tail -120 build/xcode-build.log
+
+          if [ "$STATUS" -ne 0 ]; then
+            exit "$STATUS"
+          fi
+
+      - name: Package unsigned SideStore IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APP=$(find build/DerivedData/Build/Products \
+            -type d -name "*.app" \
+            -print -quit)
+
+          if [ -z "$APP" ]; then
+            echo "::error::Compiled iOS app not found."
+            exit 1
+          fi
+
+          mkdir -p build/package/Payload
+
+          cp -R "$APP" \
+            build/package/Payload/
+
+          cd build/package
+
+          zip -qry \
+            ../Mario-Remastered-iOS-unsigned.ipa \
+            Payload
+
+          cd ../..
+
+          test -s \
+            build/Mario-Remastered-iOS-unsigned.ipa
+
+          echo "Unsigned Mario IPA created!"
+
+      - name: Upload IPA and build logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Mario-iOS-Build
-          path: build/
+          name: Mario-SideStore-iOS
+          path: |
+            build/*.ipa
+            build/import.log
+            build/export.log
+            build/xcode-build.log
+            build/xcode-targets.json
           if-no-files-found: warn
+
